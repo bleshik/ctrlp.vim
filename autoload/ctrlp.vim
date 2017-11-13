@@ -1,8 +1,9 @@
 " =============================================================================
 " File:          autoload/ctrlp.vim
 " Description:   Fuzzy file, buffer, mru, tag, etc finder.
-" Author:        Kien Nguyen <github.com/kien>
-" Version:       1.79
+" Author:        CtrlP Dev Team
+" Original:      Kien Nguyen <github.com/kien>
+" Version:       1.80
 " =============================================================================
 
 " ** Static variables {{{1
@@ -98,6 +99,7 @@ let [s:pref, s:bpref, s:opts, s:new_opts, s:lc_opts] =
 	\ 'bufname_mod':           ['s:bufname_mod', ':t'],
 	\ 'bufpath_mod':           ['s:bufpath_mod', ':~:.:h'],
 	\ 'formatline_func':       ['s:flfunc', 's:formatline(v:val)'],
+	\ 'user_command_async':    ['s:usrcmdasync', 0],
 	\ }, {
 	\ 'open_multiple_files':   's:opmul',
 	\ 'regexp':                's:regexp',
@@ -204,11 +206,21 @@ let s:hlgrps = {
 	\ }
 
 " lname, sname of the basic(non-extension) modes
-let s:coretypes = filter([
-	\ ['files', 'fil'],
-	\ ['buffers', 'buf'],
-	\ ['mru files', 'mru'],
-\ ], 'index(g:ctrlp_types, v:val[1])!=-1')
+let s:types = ['fil', 'buf', 'mru']
+if !exists('g:ctrlp_types')
+	let g:ctrlp_types = s:types
+el
+	call filter(g:ctrlp_types, "index(['fil', 'buf', 'mru'], v:val)!=-1")
+en
+let g:ctrlp_builtins = len(g:ctrlp_types)-1
+
+let s:coretype_names = {
+	\ 'fil' : 'files',
+	\ 'buf' : 'buffers',
+	\ 'mru' : 'mru files',
+	\ }
+
+let s:coretypes = map(copy(g:ctrlp_types), '[s:coretype_names[v:val], v:val]')
 
 " Get the options {{{2
 fu! s:opts(...)
@@ -291,7 +303,6 @@ fu! s:match_window_opts()
 	let s:mw_res =
 		\ s:mw =~ 'results:[^,]\+' ? str2nr(matchstr(s:mw, 'results:\zs\d\+'))
 		\ : min([s:mw_max, &lines])
-	let s:mw_res = max([s:mw_res, 1])
 endf
 "}}}1
 " * Open & Close {{{1
@@ -321,11 +332,11 @@ fu! s:Open()
 	cal s:setupblank()
 endf
 
-fu! s:Close(exit)
+fu! s:Close()
 	cal s:buffunc(0)
 	if winnr('$') == 1
 		bw!
-	elsei a:exit
+	el
 		try | bun!
 		cat | clo! | endt
 		cal s:unmarksigns()
@@ -426,6 +437,11 @@ fu! s:GlobPath(dirs, depth)
 	en
 endf
 
+fu! ctrlp#addfile(ch, file)
+	call add(g:ctrlp_allfiles, a:file)
+	cal s:BuildPrompt(1)
+endf
+
 fu! s:UserCmd(lscmd)
 	let [path, lscmd] = [s:dyncwd, a:lscmd]
 	let do_ign =
@@ -441,7 +457,13 @@ fu! s:UserCmd(lscmd)
 	if (has('win32') || has('win64')) && match(&shell, 'sh') != -1
 		let path = tr(path, '\', '/')
 	en
-	if has('patch-7.4-597') && !(has('win32') || has('win64'))
+	if s:usrcmdasync && v:version >= 800 && exists('*job_start')
+		if exists('s:job')
+			call job_stop(s:job)
+		en
+		let g:ctrlp_allfiles = []
+		let s:job = job_start([&shell, &shellcmdflag, printf(lscmd, path)], {'callback': 'ctrlp#addfile'})
+	elsei has('patch-7.4-597') && !(has('win32') || has('win64'))
 		let g:ctrlp_allfiles = systemlist(printf(lscmd, path))
 	el
 		let g:ctrlp_allfiles = split(system(printf(lscmd, path)), "\n")
@@ -550,9 +572,14 @@ endf
 fu! s:MatchedItems(items, pat, limit)
 	let exc = exists('s:crfilerel') ? s:crfilerel : ''
 	let items = s:narrowable() ? s:matched + s:mdata[3] : a:items
-	if s:matcher != {}
+	let matcher = s:getextvar('matcher')
+	if empty(matcher) || type(matcher) != 4 || !has_key(matcher, 'match')
+		unlet matcher
+		let matcher = s:matcher
+	en
+	if matcher != {}
 		let argms =
-			\ has_key(s:matcher, 'arg_type') && s:matcher['arg_type'] == 'dict' ? [{
+			\ has_key(matcher, 'arg_type') && matcher['arg_type'] == 'dict' ? [{
 			\ 'items':  items,
 			\ 'str':    a:pat,
 			\ 'limit':  a:limit,
@@ -561,7 +588,7 @@ fu! s:MatchedItems(items, pat, limit)
 			\ 'crfile': exc,
 			\ 'regex':  s:regexp,
 			\ }] : [items, a:pat, a:limit, s:mmode(), s:ispath, exc, s:regexp]
-		let lines = call(s:matcher['match'], argms, s:matcher)
+		let lines = call(matcher['match'], argms, matcher)
 	el
 		let lines = s:MatchIt(items, a:pat, a:limit, exc)
 	en
@@ -653,7 +680,7 @@ fu! s:Update(str)
 	let pat = s:matcher == {} ? s:SplitPattern(str) : str
 	let lines = s:nolim == 1 && empty(str) ? copy(g:ctrlp_lines)
 		\ : s:MatchedItems(g:ctrlp_lines, pat, s:mw_res)
-	if empty(str) | call clearmatches() | en
+	if empty(str) | cal clearmatches() | en
 	cal s:Render(lines, pat)
 	return lines
 endf
@@ -915,10 +942,13 @@ fu! s:PrtDeleteMRU()
 endf
 
 fu! s:PrtExit()
+	let bw = bufwinnr('%')
 	exe bufwinnr(s:bufnr).'winc w'
 	if bufnr('%') == s:bufnr && bufname('%') == 'ControlP'
-		noa cal s:Close(1)
+		noa cal s:Close()
 		noa winc p
+	els
+		exe bw.'winc w'
 	en
 endf
 
@@ -979,7 +1009,9 @@ fu! s:KeyLoop()
 	wh exists('s:init') && s:keyloop
 		try
 			set t_ve=
-			set guicursor=a:NONE
+			if guicursor != ''
+				set guicursor=a:NONE
+			en
 			let nr = getchar()
 		fina
 			let &t_ve = t_ve
@@ -1174,7 +1206,7 @@ fu! s:AcceptSelection(action)
 			let type = exttype == 'dict' ? exttype : 'list'
 		en
 	en
-	let actargs = type == 'dict' ? [{ 'action': md, 'line': line, 'icr': icr }]
+	let actargs = type == 'dict' ? [{ 'action': md, 'line': line, 'icr': icr, 'input': str}]
 		\ : [md, line]
 	cal call(actfunc, actargs)
 endf
@@ -1561,7 +1593,7 @@ fu! s:formatline(str)
 				let str .= printf('  %s', '<bp>'.parts[3].'</bp>')
 			en
 		el
-			let str .= printf(' %-5s %-30s  %s',
+			let str .= printf(' %-5s %-30s',
 				\ parts[0],
 				\ parts[2])
 			if (!empty(s:bufpath_mod))
@@ -1741,6 +1773,7 @@ fu! ctrlp#setpathmode(pmode, ...)
 		let spath = a:0 ? a:1 : s:crfpath
 		let markers = ['.git', '.hg', '.svn', '.bzr', '_darcs']
 		if type(s:rmarkers) == 3 && !empty(s:rmarkers)
+			if s:findroot(spath, s:rmarkers, 0, 0) != [] | retu 1 | en
 			cal filter(markers, 'index(s:rmarkers, v:val) < 0')
 			let markers = s:rmarkers + markers
 		en
@@ -1850,6 +1883,11 @@ fu! s:highlight(pat, grp)
 		en
 
 		cal matchadd('CtrlPLinePre', '^>')
+	elseif !empty(a:pat) && s:regexp &&
+				\ exists('g:ctrlp_regex_always_higlight') &&
+				\ g:ctrlp_regex_always_higlight
+		let pat = substitute(a:pat, '\\\@<!\^', '^> \\zs', 'g')
+		cal matchadd(a:grp, ( s:martcs == '' ? '\c' : '\C').pat)
 	en
 endf
 
@@ -1965,16 +2003,21 @@ fu! s:isabs(path)
 endf
 
 fu! s:bufnrfilpath(line)
-  if s:isabs(a:line) || a:line =~ '^\~[/\\]'
+  if s:isabs(a:line) || a:line =~ '^\~[/\\]' || a:line =~ '^\w\+:\/\/'
 		let filpath = a:line
 	el
 		let filpath = s:dyncwd.s:lash().a:line
 	en
 	let filpath = fnamemodify(filpath, ':p')
 	let bufnr = bufnr('^'.filpath.'$')
-	if (a:line =~ '[\/]\?\[\d\+\*No Name\]$' && !filereadable(filpath) && bufnr < 1)
-		let bufnr = str2nr(matchstr(a:line, '[\/]\?\[\zs\d\+\ze\*No Name\]$'))
-		let filpath = bufnr
+	if (!filereadable(filpath) && bufnr < 1)
+		if (a:line =~ '[\/]\?\[\d\+\*No Name\]$')
+			let bufnr = str2nr(matchstr(a:line, '[\/]\?\[\zs\d\+\ze\*No Name\]$'))
+			let filpath = bufnr
+		els
+			let bufnr = bufnr(a:line)
+			retu [bufnr, a:line]
+		en
 	en
 	retu [bufnr, filpath]
 endf
@@ -2035,7 +2078,7 @@ fu! s:checkbuf()
 endf
 
 fu! s:iscmdwin()
-	let ermsg = v:errmsg
+	let [ermsg, v:errmsg] = [v:errmsg, '']
 	sil! noa winc p
 	sil! noa winc p
 	let [v:errmsg, ermsg] = [ermsg, v:errmsg]
@@ -2277,7 +2320,7 @@ fu! s:lastvisual()
 	let cview = winsaveview()
 	let [ovreg, ovtype] = [getreg('v'), getregtype('v')]
 	let [oureg, outype] = [getreg('"'), getregtype('"')]
-	sil! norm! gv"vy
+	sil! norm! gV"vy
 	let selected = s:regisfilter('v')
 	cal setreg('v', ovreg, ovtype)
 	cal setreg('"', oureg, outype)
@@ -2357,7 +2400,7 @@ endf
 fu! s:matchbuf(item, pat)
 	let bufnr = s:bufnrfilpath(a:item)[0]
 	let parts = s:bufparts(bufnr)
-	let item = bufnr.parts[0].parts[2].s:lash().parts[3]
+	let item = s:byfname ? parts[2] : bufnr.parts[0].parts[2].s:lash().parts[3]
 	retu match(item, a:pat)
 endf
 
@@ -2376,7 +2419,7 @@ fu! s:buildpat(lst)
 			let c = a:lst[item - 1]
 			let pat .= (c == '/' ? '[^/]\{-}' : '[^'.c.'/]\{-}').a:lst[item]
 		endfo
-	else
+	els
 		for item in range(1, len(a:lst) - 1)
 			let pat .= '[^'.a:lst[item - 1].']\{-}'.a:lst[item]
 		endfo
@@ -2466,7 +2509,9 @@ endf
 fu! s:getextvar(key)
 	if s:itemtype >= len(s:coretypes) && len(g:ctrlp_ext_vars) > 0
 		let vars = g:ctrlp_ext_vars[s:itemtype - len(s:coretypes)]
-		retu has_key(vars, a:key) ? vars[a:key] : -1
+		if has_key(vars, a:key)
+			retu vars[a:key]
+		en
 	en
 	retu get(g:, 'ctrlp_' . s:matchtype . '_' . a:key, -1)
 endf
@@ -2554,6 +2599,10 @@ fu! ctrlp#init(type, ...)
 	cal s:SetWD(a:0 ? a:1 : {})
 	cal s:MapNorms()
 	cal s:MapSpecs()
+	if empty(g:ctrlp_types) && empty(g:ctrlp_ext_vars)
+		call ctrlp#exit()
+		retu
+	en
 	if type(a:type) == 0
 		let type = a:type
 	el
@@ -2580,7 +2629,7 @@ if has('autocmd')
 	aug CtrlPAug
 		au!
 		au BufEnter ControlP cal s:checkbuf()
-		au BufLeave ControlP noa cal s:Close(0)
+		au BufLeave ControlP noa cal s:Close()
 		au VimLeavePre * cal s:leavepre()
 	aug END
 en
